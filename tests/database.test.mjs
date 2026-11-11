@@ -1,0 +1,29 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
+import {PGlite} from '@electric-sql/pglite';
+const TEACHER='11111111-1111-4111-8111-111111111111';
+const OTHER='22222222-2222-4222-8222-222222222222';
+const migration=await readFile(new URL('../sql/11-不规则动词-学生布置与停留记录.sql',import.meta.url),'utf8');
+test('真实 PostgreSQL：权限、布置、停留计时、确认删除与重名重新登记',async t=>{
+ const db=new PGlite();
+ try{
+ await db.exec(`create role anon; create role authenticated; create schema auth;
+ create function auth.uid() returns uuid language sql stable as $$select nullif(current_setting('request.jwt.claim.sub',true),'')::uuid$$;
+ grant usage on schema auth to anon,authenticated;
+ create function public.is_teacher() returns boolean language sql stable as $$select auth.uid()='${TEACHER}'::uuid$$;
+ create table public.anki_test_learners(id integer primary key,name text);insert into public.anki_test_learners values(1,'existing-sentinel');`);
+ await db.exec(migration);await db.exec(migration);
+ const role=async(name,uid='')=>{assert.ok(['anon','authenticated','postgres'].includes(name));await db.exec('reset role');await db.query("select set_config('request.jwt.claim.sub',$1,false)",[uid]);if(name!=='postgres')await db.exec('set role '+name);};
+ const rpc=async(name,args)=>{const placeholders=args.map((_,i)=>'$'+(i+1)).join(',');return (await db.query('select public.'+name+'('+placeholders+') as result',args)).rows[0].result;};
+ const denied=action=>assert.rejects(action,error=>error.code==='42501');
+ const day=new Date().toISOString().slice(0,10),visit=randomUUID(),secret=randomUUID();let student,otherStudent;
+ await t.test('匿名和非老师不能查看名单或管理学生',async()=>{await role('anon');await denied(()=>db.query('select * from public.iv_students'));await denied(()=>rpc('iv_teacher_overview',[day,day,'UTC']));await role('authenticated',OTHER);await denied(()=>rpc('iv_teacher_add_student',['QA_OTHER']));await denied(()=>rpc('iv_teacher_overview',[day,day,'UTC']));assert.equal((await db.query('select count(*)::int as n from public.iv_students')).rows[0].n,0);});
+ await t.test('学生用缩写进入，同一访问重试不重复；不能挪用访问令牌',async()=>{await role('anon');const first=await rpc('iv_begin_visit',['qa_lxm',visit,secret,day]);student=first.student_id;assert.equal(first.name,'QA_LXM');assert.equal((await rpc('iv_begin_visit',['QA_LXM',visit,secret,day])).student_id,student);await denied(()=>rpc('iv_begin_visit',['QA_LXM',visit,randomUUID(),day]));await denied(()=>rpc('iv_get_assignments',[visit,randomUUID(),day]));});
+ await t.test('老师按姓名、日期、版本、编号布置；重复保存覆盖同日同版范围',async()=>{await role('authenticated',TEACHER);otherStudent=(await rpc('iv_teacher_add_student',['QA_OTHER'])).id;await rpc('iv_teacher_assign',['QA_LXM',day,'junior',1,25,'先学再回忆']);await rpc('iv_teacher_assign',['QA_LXM',day,'junior',10,20,'更新范围']);await rpc('iv_teacher_assign',['QA_LXM',day,'senior',100,128,'']);await assert.rejects(()=>rpc('iv_teacher_assign',['QA_LXM',day,'junior',1,99,'']));assert.equal((await db.query('select count(*)::int as n from public.iv_assignments')).rows[0].n,2);await role('anon');const tasks=await rpc('iv_get_assignments',[visit,secret,day]);assert.equal(tasks.length,2);assert.ok(tasks.some(a=>a.level==='junior'&&a.start===10&&a.end===20));assert.ok(tasks.some(a=>a.level==='senior'&&a.end===128));});
+ await t.test('重复或迟到心跳不重复累计，后台不加时，超额时长有服务器上限',async()=>{await role('postgres');await db.query("update public.iv_visits set last_seen_at=clock_timestamp()-interval '20 seconds' where id=$1",[visit]);await role('anon');const a=await rpc('iv_ping_visit',[visit,secret,1,15000,true,false]);assert.equal(a.active_ms,15000);const duplicate=await rpc('iv_ping_visit',[visit,secret,1,15000,true,false]);assert.equal(duplicate.accepted,false);assert.equal(duplicate.active_ms,15000);await role('postgres');await db.query("update public.iv_visits set last_seen_at=clock_timestamp()-interval '10 seconds' where id=$1",[visit]);await role('anon');assert.equal((await rpc('iv_ping_visit',[visit,secret,2,25000,false,false])).active_ms,25000);assert.equal((await rpc('iv_ping_visit',[visit,secret,3,25000,false,false])).active_ms,25000);const capped=await rpc('iv_ping_visit',[visit,secret,4,600000,true,false]);assert.ok(capped.active_ms<=28000);await denied(()=>rpc('iv_ping_visit',[visit,randomUUID(),5,600001,true,false]));});
+ await t.test('老师概览不返回写入令牌或学生答案，时间范围按指定时区查询',async()=>{await role('authenticated',TEACHER);const overview=await rpc('iv_teacher_overview',[day,day,'UTC']);assert.equal(overview.students.length,2);assert.equal(overview.visits.length,1);assert.equal(overview.visits[0].student_id,student);const text=JSON.stringify(overview);assert.ok(!text.includes(secret));assert.ok(!text.includes('write_token'));assert.ok(!text.includes('answers'));await assert.rejects(()=>rpc('iv_teacher_overview',[day,day,'invalid-timezone']));});
+ await t.test('必须输入完整缩写才删除，只清本系统，旧令牌失效，缩写可重新使用',async()=>{await role('authenticated',TEACHER);await assert.rejects(()=>rpc('iv_teacher_delete_student',[student,'WRONG']));const result=await rpc('iv_teacher_delete_student',[student,'QA_LXM']);assert.equal(result.deleted,true);assert.equal(result.visits,1);assert.equal(result.assignments,2);const recreated=await rpc('iv_teacher_add_student',['QA_LXM']);assert.notEqual(recreated.id,student);assert.equal((await db.query('select count(*)::int as n from public.iv_students where id=$1',[otherStudent])).rows[0].n,1);await role('postgres');assert.equal((await db.query('select count(*)::int as n from public.anki_test_learners')).rows[0].n,1);assert.equal((await db.query('select count(*)::int as n from public.iv_visits')).rows[0].n,0);await role('anon');await denied(()=>rpc('iv_ping_visit',[visit,secret,6,600002,true,false]));});
+ }finally{await db.close();}
+});
