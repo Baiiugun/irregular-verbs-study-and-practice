@@ -12,7 +12,7 @@ GitHub Pages 启用后使用以下地址（仓库推送本身不代表网页已�
 
 ## 数据库启用
 
-沿用现有 Supabase 与 `public.is_teacher()`。由老师本人进入 Supabase Studio → SQL Editor → 新建查询，完整复制并运行 [11 号 SQL](sql/11-不规则动词-学生布置与停留记录.sql)。成功后网页会自动连接，不需要在网页代码中填写老师密码。
+沿用现有 Supabase 与 `public.is_teacher()`。可先打开 [带复制按钮的启用说明](docs/启用数据库-给老师.html)。由老师本人进入 Supabase Studio → SQL Editor → 新建查询，完整复制并运行 [11 号 SQL](sql/11-不规则动词-学生布置与停留记录.sql)。成功后网页会自动连接，不需要在网页代码中填写老师密码。
 
 只创建 `iv_students`、`iv_assignments`、`iv_visits` 和 `iv_` 函数。学生不能直接查询表，只能用单次访问的随机令牌更新自己的停留记录；老师函数同时检查 Supabase 登录和现有老师权限。
 
@@ -45,3 +45,5 @@ GitHub Pages 启用后使用以下地址（仓库推送本身不代表网页已�
 - `docs/`：技术规范、改动日志、操作记录。
 
 最近本机验证：2026-11-10 21:48 PST。真实 Supabase 尚待运行 11 号 SQL，GitHub Pages 启用状态以操作记录为准。
+
+当前发布状态：代码已推送；仓库仍为私有。GitHub Pages 创建返回 422（当前套餐不支持该私有仓库），等待用户同意公开后继续发布。Supabase 业务尚待本人运行数据库脚本。

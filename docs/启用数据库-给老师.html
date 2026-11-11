@@ -1,0 +1,181 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>启用不规则动词数据库 · 给老师</title><style>body{font:16px/1.9 system-ui,"Microsoft YaHei";max-width:980px;margin:auto;padding:30px;background:#f4f5ef;color:#294435}h1{font-size:27px}section{border:1px solid #d1dec6;background:#fffefa;padding:24px;border-radius:12px;margin:20px 0}button,a{font:650 17px/1.4 system-ui;min-height:48px;border:2px solid #6e9560;background:#245947;color:#fff;padding:12px 20px;border-radius:8px;cursor:pointer}textarea{width:100%;height:440px;font:13px/1.6 Consolas,monospace;border:1px solid #b9cda8;border-radius:8px;padding:15px;margin-top:15px;box-sizing:border-box;background:#fbfdf8}li{margin:12px 0}.muted{color:#718762;font-size:14px}#copy-status{color:#35613a}</style><h1>最后一步：启用 Supabase 数据库</h1><p>不需要把密码告诉 AI。这份脚本只建立不规则动词专用的数据表和权限。</p><section><ol><li>点击下面的“复制完整 SQL”。</li><li>打开你原来使用的 Supabase 管理页面，进入 <strong>SQL Editor</strong>（SQL 编辑器）。</li><li><strong>新建查询</strong>，把复制的内容完整粘贴进去，不覆盖原来的查询。</li><li>点击 <strong>Run</strong>（运行）。看到 <strong>iv database setup complete</strong> 或 Success 就完成了。</li><li>回到聊天告诉我“SQL 已运行成功”；我会核对云端接口，再继续完成上线。</li></ol><p class="muted">脚本已在本机 PostgreSQL 验证，可重复运行。它不会改动其他系统的学生、词库或数据。</p></section><section><button id="copy" type="button">复制完整 SQL</button><p id="copy-status" role="status"></p><textarea id="sql" readonly aria-label="完整初始化 SQL">-- 不规则动词专用表；沿用现有 Supabase Auth 和 public.is_teacher()。
+-- 在 Supabase Studio 的 SQL Editor 新建查询，完整运行本文件。可重复运行。
+-- 不保存学生答案、打字内容或按键，只保存姓名缩写、布置和访问时段。
+-- 不修改其他系统的表、词库或学生记录。
+begin;
+set local lock_timeout = &#x27;5s&#x27;;
+do $$ begin
+ if to_regprocedure(&#x27;public.is_teacher()&#x27;) is null then raise exception &#x27;Existing public.is_teacher() is required&#x27;; end if;
+end $$;
+create table if not exists public.iv_students(
+ id uuid primary key default gen_random_uuid(),
+ name text not null unique check(name ~ &#x27;^[A-Z][A-Z0-9_-]{0,23}$&#x27;),
+ created_at timestamptz not null default clock_timestamp()
+);
+create table if not exists public.iv_assignments(
+ id uuid primary key default gen_random_uuid(),
+ student_id uuid not null references public.iv_students(id) on delete cascade,
+ assignment_date date not null,
+ level text not null check(level in (&#x27;junior&#x27;,&#x27;senior&#x27;)),
+ start_number integer not null check(start_number&gt;=1),
+ end_number integer not null,
+ note text not null default &#x27;&#x27; check(length(note)&lt;=300),
+ updated_at timestamptz not null default clock_timestamp(),
+ unique(student_id,assignment_date,level),
+ check(end_number&gt;=start_number and end_number&lt;=case when level=&#x27;junior&#x27; then 98 else 128 end)
+);
+create table if not exists public.iv_visits(
+ id uuid primary key,
+ student_id uuid not null references public.iv_students(id) on delete cascade,
+ write_token uuid not null,
+ entered_at timestamptz not null default clock_timestamp(),
+ last_seen_at timestamptz not null default clock_timestamp(),
+ last_active_at timestamptz not null default clock_timestamp(),
+ ended_at timestamptz,
+ active_ms bigint not null default 0 check(active_ms&gt;=0),
+ reported_ms bigint not null default 0 check(reported_ms&gt;=0),
+ last_seq bigint not null default 0,
+ is_visible boolean not null default true
+);
+create index if not exists iv_visits_student_time_idx on public.iv_visits(student_id,entered_at desc);
+create index if not exists iv_visits_entered_idx on public.iv_visits(entered_at desc);
+alter table public.iv_students enable row level security;
+alter table public.iv_assignments enable row level security;
+alter table public.iv_visits enable row level security;
+revoke all on public.iv_students,public.iv_assignments,public.iv_visits from public,anon,authenticated;
+grant select on public.iv_students,public.iv_assignments,public.iv_visits to authenticated;
+drop policy if exists iv_teacher_read_students on public.iv_students;
+create policy iv_teacher_read_students on public.iv_students for select to authenticated using(public.is_teacher());
+drop policy if exists iv_teacher_read_assignments on public.iv_assignments;
+create policy iv_teacher_read_assignments on public.iv_assignments for select to authenticated using(public.is_teacher());
+drop policy if exists iv_teacher_read_visits on public.iv_visits;
+create policy iv_teacher_read_visits on public.iv_visits for select to authenticated using(public.is_teacher());
+
+create or replace function public.iv_require_teacher() returns void
+language plpgsql security definer set search_path=public,pg_temp as $$
+begin
+ if auth.uid() is null or not coalesce(public.is_teacher(),false) then raise exception &#x27;Teacher login required&#x27; using errcode=&#x27;42501&#x27;; end if;
+end $$;
+revoke all on function public.iv_require_teacher() from public,anon;
+grant execute on function public.iv_require_teacher() to authenticated;
+
+create or replace function public.iv_begin_visit(p_name text,p_visit_id uuid,p_secret uuid,p_day date)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare n text:=upper(btrim(p_name)); s public.iv_students; v public.iv_visits;
+begin
+ if n is null or n !~ &#x27;^[A-Z][A-Z0-9_-]{0,23}$&#x27; or p_visit_id is null or p_secret is null or p_day is null then raise exception &#x27;Invalid student name or visit&#x27;; end if;
+ insert into public.iv_students(name) values(n) on conflict(name) do update set name=excluded.name returning * into s;
+ select * into v from public.iv_visits where id=p_visit_id for update;
+ if found then
+  if v.student_id&lt;&gt;s.id or v.write_token&lt;&gt;p_secret then raise exception &#x27;Invalid visit token&#x27; using errcode=&#x27;42501&#x27;; end if;
+ else
+  insert into public.iv_visits(id,student_id,write_token) values(p_visit_id,s.id,p_secret) returning * into v;
+ end if;
+ return jsonb_build_object(&#x27;student_id&#x27;,s.id,&#x27;name&#x27;,s.name,&#x27;visit_id&#x27;,v.id,&#x27;entered_at&#x27;,v.entered_at,&#x27;assignments&#x27;,
+  (select coalesce(jsonb_agg(jsonb_build_object(&#x27;id&#x27;,a.id,&#x27;date&#x27;,a.assignment_date,&#x27;level&#x27;,a.level,&#x27;start&#x27;,a.start_number,&#x27;end&#x27;,a.end_number,&#x27;note&#x27;,a.note) order by a.assignment_date desc,a.level),&#x27;[]&#x27;::jsonb)
+   from public.iv_assignments a where a.student_id=s.id and a.assignment_date between p_day-7 and p_day+7));
+end $$;
+revoke all on function public.iv_begin_visit(text,uuid,uuid,date) from public;
+grant execute on function public.iv_begin_visit(text,uuid,uuid,date) to anon,authenticated;
+
+create or replace function public.iv_get_assignments(p_visit_id uuid,p_secret uuid,p_day date)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare v public.iv_visits;
+begin
+ select * into v from public.iv_visits where id=p_visit_id and write_token=p_secret;
+ if not found then raise exception &#x27;Invalid visit token&#x27; using errcode=&#x27;42501&#x27;; end if;
+ return (select coalesce(jsonb_agg(jsonb_build_object(&#x27;id&#x27;,a.id,&#x27;date&#x27;,a.assignment_date,&#x27;level&#x27;,a.level,&#x27;start&#x27;,a.start_number,&#x27;end&#x27;,a.end_number,&#x27;note&#x27;,a.note) order by a.assignment_date desc,a.level),&#x27;[]&#x27;::jsonb)
+  from public.iv_assignments a where a.student_id=v.student_id and a.assignment_date between p_day-7 and p_day+7);
+end $$;
+revoke all on function public.iv_get_assignments(uuid,uuid,date) from public;
+grant execute on function public.iv_get_assignments(uuid,uuid,date) to anon,authenticated;
+
+create or replace function public.iv_ping_visit(p_visit_id uuid,p_secret uuid,p_seq bigint,p_total_ms bigint,p_visible boolean,p_finished boolean default false)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare v public.iv_visits; t timestamptz:=clock_timestamp(); delta bigint; cap_ms bigint;
+begin
+ if p_seq is null or p_seq&lt;1 or p_total_ms is null or p_total_ms&lt;0 or p_total_ms&gt;604800000 or p_visible is null then raise exception &#x27;Invalid visit heartbeat&#x27;; end if;
+ select * into v from public.iv_visits where id=p_visit_id and write_token=p_secret for update;
+ if not found then raise exception &#x27;Invalid visit token&#x27; using errcode=&#x27;42501&#x27;; end if;
+ if p_seq&lt;=v.last_seq then return jsonb_build_object(&#x27;active_ms&#x27;,v.active_ms,&#x27;accepted&#x27;,false); end if;
+ if p_total_ms&lt;v.reported_ms then raise exception &#x27;Visit time cannot decrease&#x27;; end if;
+ cap_ms:=greatest(0,floor(extract(epoch from(t-v.last_seen_at))*1000)::bigint)+2000;
+ delta:=least(p_total_ms-v.reported_ms,cap_ms);
+ update public.iv_visits set active_ms=active_ms+delta,reported_ms=p_total_ms,last_seq=p_seq,last_seen_at=t,
+  last_active_at=case when p_visible or delta&gt;0 then t else last_active_at end,is_visible=p_visible,
+  ended_at=case when p_finished then t when p_visible then null else ended_at end
+ where id=p_visit_id returning * into v;
+ return jsonb_build_object(&#x27;active_ms&#x27;,v.active_ms,&#x27;accepted&#x27;,true);
+end $$;
+revoke all on function public.iv_ping_visit(uuid,uuid,bigint,bigint,boolean,boolean) from public;
+grant execute on function public.iv_ping_visit(uuid,uuid,bigint,bigint,boolean,boolean) to anon,authenticated;
+
+create or replace function public.iv_teacher_add_student(p_name text)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare n text:=upper(btrim(p_name)); s public.iv_students;
+begin
+ perform public.iv_require_teacher();
+ if n is null or n !~ &#x27;^[A-Z][A-Z0-9_-]{0,23}$&#x27; then raise exception &#x27;Invalid student abbreviation&#x27;; end if;
+ insert into public.iv_students(name) values(n) on conflict(name) do update set name=excluded.name returning * into s;
+ return jsonb_build_object(&#x27;id&#x27;,s.id,&#x27;name&#x27;,s.name);
+end $$;
+revoke all on function public.iv_teacher_add_student(text) from public,anon;
+grant execute on function public.iv_teacher_add_student(text) to authenticated;
+
+create or replace function public.iv_teacher_assign(p_name text,p_date date,p_level text,p_start integer,p_end integer,p_note text default &#x27;&#x27;)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare s jsonb; a public.iv_assignments;
+begin
+ perform public.iv_require_teacher();
+ if p_date is null or p_level is null or p_level not in (&#x27;junior&#x27;,&#x27;senior&#x27;) or p_start is null or p_end is null or p_start&lt;1 or p_end&lt;p_start or p_end&gt;(case when p_level=&#x27;junior&#x27; then 98 else 128 end) or length(coalesce(p_note,&#x27;&#x27;))&gt;300 then raise exception &#x27;Invalid assignment range&#x27;; end if;
+ s:=public.iv_teacher_add_student(p_name);
+ insert into public.iv_assignments(student_id,assignment_date,level,start_number,end_number,note)
+ values((s-&gt;&gt;&#x27;id&#x27;)::uuid,p_date,p_level,p_start,p_end,coalesce(p_note,&#x27;&#x27;))
+ on conflict(student_id,assignment_date,level) do update set start_number=excluded.start_number,end_number=excluded.end_number,note=excluded.note,updated_at=clock_timestamp()
+ returning * into a;
+ return jsonb_build_object(&#x27;id&#x27;,a.id,&#x27;name&#x27;,s-&gt;&gt;&#x27;name&#x27;,&#x27;date&#x27;,a.assignment_date,&#x27;level&#x27;,a.level,&#x27;start&#x27;,a.start_number,&#x27;end&#x27;,a.end_number);
+end $$;
+revoke all on function public.iv_teacher_assign(text,date,text,integer,integer,text) from public,anon;
+grant execute on function public.iv_teacher_assign(text,date,text,integer,integer,text) to authenticated;
+
+create or replace function public.iv_teacher_unassign(p_assignment uuid)
+returns boolean language plpgsql security definer set search_path=public,pg_temp as $$
+begin perform public.iv_require_teacher();delete from public.iv_assignments where id=p_assignment;return found;end $$;
+revoke all on function public.iv_teacher_unassign(uuid) from public,anon;
+grant execute on function public.iv_teacher_unassign(uuid) to authenticated;
+
+create or replace function public.iv_teacher_overview(p_from date,p_to date,p_timezone text default &#x27;UTC&#x27;)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare t timestamptz:=clock_timestamp(); tz text:=coalesce(p_timezone,&#x27;UTC&#x27;);
+begin
+ perform public.iv_require_teacher();
+ if p_from is null or p_to is null or p_to&lt;p_from or p_to-p_from&gt;366 then raise exception &#x27;Invalid date range&#x27;; end if;
+ if not exists(select 1 from pg_timezone_names where name=tz) then raise exception &#x27;Invalid timezone&#x27;; end if;
+ return jsonb_build_object(&#x27;server_time&#x27;,t,
+ &#x27;students&#x27;,(select coalesce(jsonb_agg(jsonb_build_object(&#x27;id&#x27;,s.id,&#x27;name&#x27;,s.name,&#x27;created_at&#x27;,s.created_at) order by s.name),&#x27;[]&#x27;::jsonb) from public.iv_students s),
+ &#x27;assignments&#x27;,(select coalesce(jsonb_agg(jsonb_build_object(&#x27;id&#x27;,a.id,&#x27;student_id&#x27;,a.student_id,&#x27;date&#x27;,a.assignment_date,&#x27;level&#x27;,a.level,&#x27;start&#x27;,a.start_number,&#x27;end&#x27;,a.end_number,&#x27;note&#x27;,a.note) order by a.assignment_date desc),&#x27;[]&#x27;::jsonb) from public.iv_assignments a where a.assignment_date between p_from and p_to),
+ &#x27;visits&#x27;,(select coalesce(jsonb_agg(jsonb_build_object(&#x27;id&#x27;,v.id,&#x27;student_id&#x27;,v.student_id,&#x27;entered_at&#x27;,v.entered_at,&#x27;last_active_at&#x27;,v.last_active_at,&#x27;last_seen_at&#x27;,v.last_seen_at,&#x27;ended_at&#x27;,v.ended_at,&#x27;active_ms&#x27;,v.active_ms,&#x27;online&#x27;,v.is_visible and v.ended_at is null and v.last_seen_at&gt;t-interval &#x27;50 seconds&#x27;) order by v.entered_at desc),&#x27;[]&#x27;::jsonb)
+   from(select * from public.iv_visits where entered_at&gt;=(p_from::timestamp at time zone tz) and entered_at&lt;((p_to+1)::timestamp at time zone tz) order by entered_at desc limit 5000)v));
+end $$;
+revoke all on function public.iv_teacher_overview(date,date,text) from public,anon;
+grant execute on function public.iv_teacher_overview(date,date,text) to authenticated;
+
+create or replace function public.iv_teacher_delete_student(p_student uuid,p_confirm_name text)
+returns jsonb language plpgsql security definer set search_path=public,pg_temp as $$
+declare s public.iv_students; n_visits integer; n_assignments integer;
+begin
+ perform public.iv_require_teacher();
+ select * into s from public.iv_students where id=p_student for update;
+ if not found then raise exception &#x27;Student not found&#x27;; end if;
+ if upper(btrim(coalesce(p_confirm_name,&#x27;&#x27;)))&lt;&gt;s.name then raise exception &#x27;Confirmation must match the complete student abbreviation&#x27;; end if;
+ select count(*) into n_visits from public.iv_visits where student_id=s.id;
+ select count(*) into n_assignments from public.iv_assignments where student_id=s.id;
+ delete from public.iv_students where id=s.id;
+ return jsonb_build_object(&#x27;deleted&#x27;,true,&#x27;visits&#x27;,n_visits,&#x27;assignments&#x27;,n_assignments);
+end $$;
+revoke all on function public.iv_teacher_delete_student(uuid,text) from public,anon;
+grant execute on function public.iv_teacher_delete_student(uuid,text) to authenticated;
+notify pgrst,&#x27;reload schema&#x27;;
+commit;
+select &#x27;iv database setup complete&#x27; as status;
+</textarea></section><script>document.getElementById('copy').addEventListener('click',async()=>{const area=document.getElementById('sql');try{await navigator.clipboard.writeText(area.value);document.getElementById('copy-status').textContent='已复制。请到 Supabase SQL Editor 新建查询，粘贴并运行。';}catch{area.focus();area.select();document.getElementById('copy-status').textContent='已选中完整脚本，请按 Ctrl+C 复制。';}});</script></html>
