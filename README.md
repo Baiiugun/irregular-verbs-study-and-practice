@@ -4,15 +4,15 @@
 
 ## 页面地址
 
-GitHub Pages 启用后使用以下地址（仓库推送本身不代表网页已启用）：
+已启用 GitHub Pages，以下学生页与老师页已核对可访问：
 
 - 学生页：[https://baiiugun.github.io/irregular-verbs-study-and-practice/](https://baiiugun.github.io/irregular-verbs-study-and-practice/)
 - 老师页：[不规则动词学习记录-老师登录版本](https://baiiugun.github.io/irregular-verbs-study-and-practice/不规则动词学习记录-老师登录版本.html)
 - 指定姓名示例：学生页后加 `#student=LXM`；老师页可复制这种链接。姓名缩写不是密码。
 
-## 数据库启用
+## 数据库（本实例已启用）
 
-沿用现有 Supabase 与 `public.is_teacher()`。可先打开 [带复制按钮的启用说明](docs/启用数据库-给老师.html)。由老师本人进入 Supabase Studio → SQL Editor → 新建查询，完整复制并运行 [11 号 SQL](sql/11-不规则动词-学生布置与停留记录.sql)。成功后网页会自动连接，不需要在网页代码中填写老师密码。
+本实例的 11 号 SQL 已由老师本人运行成功，云端接口和匿名访问限制已核对。沿用现有 Supabase 与 `public.is_teacher()`。可先打开 [带复制按钮的启用说明](docs/启用数据库-给老师.html)。由老师本人进入 Supabase Studio → SQL Editor → 新建查询，完整复制并运行 [11 号 SQL](sql/11-不规则动词-学生布置与停留记录.sql)。成功后网页会自动连接，不需要在网页代码中填写老师密码。
 
 只创建 `iv_students`、`iv_assignments`、`iv_visits` 和 `iv_` 函数。学生不能直接查询表，只能用单次访问的随机令牌更新自己的停留记录；老师函数同时检查 Supabase 登录和现有老师权限。
 
@@ -44,6 +44,6 @@ GitHub Pages 启用后使用以下地址（仓库推送本身不代表网页已�
 - `sql/`：老师本人运行的初始化 SQL。
 - `docs/`：技术规范、改动日志、操作记录。
 
-最近本机验证：2026-11-10 21:48 PST。真实 Supabase 尚待运行 11 号 SQL，GitHub Pages 启用状态以操作记录为准。
+最近验证：2026-11-10 21:59 PST。本机 15 项检查通过；已核对真实 Supabase 接口与匿名权限、线上学生/老师页、脚本、样式和四个 PDF。未代替老师输入密码登录。
 
-当前发布状态：代码已推送；仓库仍为私有。GitHub Pages 创建返回 422（当前套餐不支持该私有仓库），等待用户同意公开后继续发布。Supabase 业务尚待本人运行数据库脚本。
+当前发布状态：✅ 用户已明确允许仓库公开并发布；✅ 仓库已公开；✅ GitHub Pages 已上线；✅ 用户运行 11 号 SQL 成功，Supabase 业务接口已启用。
